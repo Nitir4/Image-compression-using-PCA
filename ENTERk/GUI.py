@@ -1,4 +1,21 @@
+from tkinter import Label, Frame, Button, Entry, LEFT, RIGHT
+try:
+    from .Libraries import DND_FILES
+except ImportError:
+    from Libraries import DND_FILES
+
 class PCACompressorGUI:
+    try:
+        from .displayimage import display_image, display_size_reduction
+        from .imageprocessing import load_image, on_drop, _process_image
+        from .imagecompression import on_k_input_change, update_image
+        from .plot import plot_size_vs_k, plot_variance_vs_k, _show_plot_window
+    except ImportError:
+        from displayimage import display_image, display_size_reduction
+        from imageprocessing import load_image, on_drop, _process_image
+        from imagecompression import on_k_input_change, update_image
+        from plot import plot_size_vs_k, plot_variance_vs_k, _show_plot_window
+
     def __init__(self, root):
         self.root = root
         self.root.title("PCA Image Compression Tool")
@@ -55,6 +72,7 @@ class PCACompressorGUI:
         self.compressed_label.pack(side=RIGHT, padx=20)
 
         # Allow drag-and-drop functionality for loading images
-        self.root.drop_target_register(DND_FILES)
-        self.root.dnd_bind('<<Drop>>', self.on_drop)
+        if hasattr(self.root, 'drop_target_register'):
+            self.root.drop_target_register(DND_FILES)
+            self.root.dnd_bind('<<Drop>>', self.on_drop)
 

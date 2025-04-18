@@ -1,4 +1,4 @@
-import math
+import queue
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -11,73 +11,23 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from skimage.metrics import structural_similarity as ssim
 
-# --- Custom PCA Implementation ---
-def custom_pca(channel: np.ndarray, k: int):
-    """Custom PCA on a single channel."""
-    mean_cols = channel.mean(axis=0)
-    centered = channel.astype(np.float64) - mean_cols
-    cov = np.cov(centered, rowvar=False)
-    eigvals, eigvecs = np.linalg.eigh(cov)
-    # sort descending
-    idx = np.argsort(eigvals)[::-1]
-    eigvals = eigvals[idx]
-    eigvecs = eigvecs[:, idx]
-    # take top-k
-    k_eff = min(k, eigvecs.shape[1])
-    V_k = eigvecs[:, :k_eff]
-    proj = centered @ V_k
-    recon = proj @ V_k.T
-    recon += mean_cols
-    return np.clip(recon, 0, 255).astype(np.uint8), eigvals
-
-# --- Custom SVD Implementation ---
-def custom_svd(channel: np.ndarray, k: int):
-    """Custom SVD on a single channel."""
-    A = channel.astype(np.float64)
-    U, S, Vt = np.linalg.svd(A, full_matrices=False)
-    k_eff = min(k, len(S))
-    S_trunc = np.zeros_like(S)
-    S_trunc[:k_eff] = S[:k_eff]
-    recon = (U * S_trunc) @ Vt
-    return np.clip(recon, 0, 255).astype(np.uint8), S
-
-# --- Compression Utilities ---
-def compress_image_full(image: np.ndarray, k: int, method: str):
-    """
-    Compress image (2D gray or 3D BGR) channel-wise using custom PCA/SVD.
-    Returns:
-      - compressed uint8 image
-      - mean explained-variance ratio across channels
-    """
-    chans = [image] if image.ndim == 2 else cv2.split(image)
-    recon_chs, ratios = [], []
-    for ch in chans:
-        if method == 'PCA':
-            recon, eigvals = custom_pca(ch, k)
-            total = eigvals.sum() if eigvals.sum() > 0 else 1.0
-            ratio = float(eigvals[:k].sum() / total)
-        else:
-            recon, S = custom_svd(ch, k)
-            total = (S**2).sum() if (S**2).sum() > 0 else 1.0
-            ratio = float((S[:k]**2).sum() / total)
-        recon_chs.append(recon)
-        ratios.append(ratio)
-    merged = recon_chs[0] if len(recon_chs) == 1 else cv2.merge(recon_chs)
-    return merged, float(np.mean(ratios))
-
-# --- Quality Metrics ---
-def mse_metric(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.mean((a.astype(np.float64) - b.astype(np.float64))**2))
-
-def psnr_metric(a: np.ndarray, b: np.ndarray) -> float:
-    mse = mse_metric(a, b)
-    return float('inf') if mse == 0 else 20*math.log10(255.0/math.sqrt(mse))
+try:
+    from .compression import (custom_pca, custom_svd, compress_image_full,
+                              mse_metric, psnr_metric, validate_k)
+except ImportError:  # python Complete/main.py
+    from compression import (custom_pca, custom_svd, compress_image_full,
+                             mse_metric, psnr_metric, validate_k)
 
 def ssim_metric(a: np.ndarray, b: np.ndarray) -> float:
     if a.ndim == 3:
         a = cv2.cvtColor(a, cv2.COLOR_BGR2GRAY)
         b = cv2.cvtColor(b, cv2.COLOR_BGR2GRAY)
-    return float(ssim(a, b, data_range=255))
+    window = min(7, *a.shape[:2])
+    if window < 3:
+        return float('nan')  # SSIM is undefined for fewer than 3 pixels per side.
+    if window % 2 == 0:
+        window -= 1
+    return float(ssim(a, b, data_range=255, win_size=window))
 
 # --- GUI Application ---
 class ImageCompressionApp(tk.Tk):
@@ -92,11 +42,16 @@ class ImageCompressionApp(tk.Tk):
         self.orig_color = None
         self.orig_gray = None
 
+        self.comp_pil = None
+        self._updates = queue.Queue()
+        self._busy = False
         self._build_ui()
+        self.after(50, self._drain_updates)
 
     def _build_ui(self):
         top = ttk.Frame(self, padding=5); top.pack(fill=tk.X)
-        ttk.Button(top, text="Load Image", command=self.open_image).pack(side=tk.LEFT)
+        self.btn_load = ttk.Button(top, text="Load Image", command=self.open_image)
+        self.btn_load.pack(side=tk.LEFT)
         self.file_lbl = ttk.Label(top, text="No file selected", font=self.font)
         self.file_lbl.pack(side=tk.LEFT, padx=10)
         self.rgb_var = tk.BooleanVar(value=False)
@@ -110,8 +65,16 @@ class ImageCompressionApp(tk.Tk):
     def open_image(self):
         path = filedialog.askopenfilename(filetypes=[("Images","*.png *.jpg *.jpeg *.bmp")])
         if not path: return
+        try:
+            with Image.open(path) as image:
+                pil = image.convert('RGB')
+        except (OSError, ValueError) as exc:
+            messagebox.showerror('Cannot load image', str(exc)); return
         self.file_lbl.config(text=os.path.basename(path))
-        pil = Image.open(path).convert('RGB')
+        self.comp_pil = None
+        self.btn_save.config(state=tk.DISABLED)
+        self.comp_lbl1.config(image='')
+        self.comp_lbl1.image = None
         arr = np.array(pil)
         self.orig_pil   = pil
         self.orig_color = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
@@ -174,88 +137,133 @@ class ImageCompressionApp(tk.Tk):
         self.canvas = FigureCanvasTkAgg(fig, master=frm)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-    def compress_image(self):
-        if not self.orig_pil:
-            messagebox.showwarning("No Image","Load an image first."); return
-        k, method, rgb = self.k_cmp.get(), self.method_var.get(), self.rgb_var.get()
-        self.btn_cmp.config(state=tk.DISABLED)
-        threading.Thread(target=self._thread_compress, args=(k,method,rgb), daemon=True).start()
+    def _ui(self, callback):
+        self._updates.put(callback)
 
-    def _thread_compress(self, k, method, rgb):
-        self.after(0, lambda: self.prog1.config(text=f"Compressing k={k}..."))
-        data = self.orig_color if rgb else self.orig_gray
+    def _drain_updates(self):
+        while True:
+            try:
+                callback = self._updates.get_nowait()
+            except queue.Empty:
+                break
+            callback()
+        self.after(50, self._drain_updates)
+
+    def _finish_job(self):
+        self._busy = False
+        for button in (self.btn_load, self.btn_cmp, self.btn_cmp2, self.btn_an):
+            button.config(state=tk.NORMAL)
+        self.btn_save.config(state=tk.NORMAL if self.comp_pil is not None else tk.DISABLED)
+
+    def _start_job(self, worker, args, status):
+        if self._busy:
+            return
+        if self.orig_pil is None:
+            messagebox.showwarning('No Image', 'Load an image first.'); return
+        try:
+            validate_k(args[0])
+        except (ValueError, TypeError) as exc:
+            messagebox.showerror('Invalid k', str(exc)); return
+        self._busy = True
+        for button in (self.btn_load, self.btn_cmp, self.btn_cmp2, self.btn_an, self.btn_save):
+            button.config(state=tk.DISABLED)
+        data = (self.orig_color if args[-1] else self.orig_gray).copy()
+        def run():
+            try:
+                worker(data, *args)
+            except Exception as exc:
+                error = str(exc)
+                self._ui(lambda: (status.config(text='Failed.'), messagebox.showerror('Processing failed', error)))
+            finally:
+                self._ui(self._finish_job)
+        threading.Thread(target=run, daemon=True).start()
+
+    def compress_image(self):
+        try:
+            k = self.k_cmp.get()
+        except tk.TclError:
+            messagebox.showerror('Invalid k', 'k must be a positive integer.'); return
+        self._start_job(self._thread_compress, (k, self.method_var.get(), self.rgb_var.get()), self.prog1)
+
+    def _thread_compress(self, data, k, method, rgb):
+        self._ui(lambda: self.prog1.config(text=f'Compressing k={k}...'))
         comp, var = compress_image_full(data, k, method)
-        mse  = mse_metric(data, comp)
-        psnr = psnr_metric(data, comp)
-        sm   = ssim_metric(data, comp)
+        mse, psnr, sm = mse_metric(data, comp), psnr_metric(data, comp), ssim_metric(data, comp)
         disp = cv2.cvtColor(comp, cv2.COLOR_BGR2RGB) if rgb else comp
-        pil  = Image.fromarray(disp); pil.thumbnail((200,200)); tk_img = ImageTk.PhotoImage(pil)
-        stats = f"{method} k={k}\nVar:{var:.2%} MSE:{mse:.2f} PSNR:{psnr:.2f} SSIM:{sm:.4f}"
-        self.after(0, lambda: (
-            self.comp_lbl1.config(image=tk_img),
-            setattr(self,'comp_pil',pil),
-            self.stats1.config(text=stats),
-            self.prog1.config(text="Done."),
-            self.btn_cmp.config(state=tk.NORMAL),
-            self.btn_save.config(state=tk.NORMAL)
-        ))
+        full_image = Image.fromarray(disp)
+        stats = f'{method} k={k}\nVar:{var:.2%} MSE:{mse:.2f} PSNR:{psnr:.2f} SSIM:{sm:.4f}'
+        self._ui(lambda: self._show_compression(full_image, stats))
+
+    def _show_compression(self, full_image, stats):
+        self.comp_pil = full_image
+        thumbnail = full_image.copy()
+        thumbnail.thumbnail((200, 200))
+        preview = ImageTk.PhotoImage(thumbnail)
+        self.comp_lbl1.config(image=preview)
+        self.comp_lbl1.image = preview
+        self.stats1.config(text=stats)
+        self.prog1.config(text='Done.')
 
     def save_image(self):
-        if not hasattr(self,'comp_pil'): return
+        if self.comp_pil is None: return
         ext = os.path.splitext(self.file_lbl.cget('text'))[-1]
         path = filedialog.asksaveasfilename(defaultextension=ext)
         if path:
-            self.comp_pil.save(path)
+            try:
+                self.comp_pil.save(path)
+            except (OSError, ValueError) as exc:
+                messagebox.showerror('Cannot save image', str(exc)); return
             messagebox.showinfo("Saved", f"Saved to {path}")
 
     def compare_methods(self):
-        if not self.orig_pil:
-            messagebox.showwarning("No Image","Load an image first."); return
-        k, rgb = self.k_cmp2.get(), self.rgb_var.get()
-        self.btn_cmp2.config(state=tk.DISABLED)
-        threading.Thread(target=self._thread_compare, args=(k,rgb), daemon=True).start()
+        try:
+            k = self.k_cmp2.get()
+        except tk.TclError:
+            messagebox.showerror('Invalid k', 'k must be a positive integer.'); return
+        self._start_job(self._thread_compare, (k, self.rgb_var.get()), self.prog2)
 
-    def _thread_compare(self, k, rgb):
-        self.after(0, lambda: self.prog2.config(text=f"Comparing k={k}..."))
-        data = self.orig_color if rgb else self.orig_gray
+    def _thread_compare(self, data, k, rgb):
+        self._ui(lambda: self.prog2.config(text=f'Comparing k={k}...'))
         p_img, var_p = compress_image_full(data, k, 'PCA')
         s_img, var_s = compress_image_full(data, k, 'SVD')
         mse_p, psnr_p, sm_p = mse_metric(data, p_img), psnr_metric(data, p_img), ssim_metric(data, p_img)
         mse_s, psnr_s, sm_s = mse_metric(data, s_img), psnr_metric(data, s_img), ssim_metric(data, s_img)
-        def to_pil(im): return Image.fromarray(cv2.cvtColor(im, cv2.COLOR_BGR2RGB)) if rgb else Image.fromarray(im)
-        pil_p, pil_s = to_pil(p_img), to_pil(s_img)
-        for lbl, pil in ((self.pca_lbl2,pil_p),(self.svd_lbl2,pil_s)):
-            tmp=pil.copy(); tmp.thumbnail((200,200)); tl=ImageTk.PhotoImage(tmp)
-            lbl.config(image=tl); lbl.image=tl
+        images = [Image.fromarray(cv2.cvtColor(im, cv2.COLOR_BGR2RGB) if rgb else im) for im in (p_img, s_img)]
         stats = (
-            f"PCA MSE:{mse_p:.2f} PSNR:{psnr_p:.2f} SSIM:{sm_p:.4f} Var:{var_p:.2%}\n"
-            f"SVD MSE:{mse_s:.2f} PSNR:{psnr_s:.2f} SSIM:{sm_s:.4f} Var:{var_s:.2%}"
+            f'PCA MSE:{mse_p:.2f} PSNR:{psnr_p:.2f} SSIM:{sm_p:.4f} Var:{var_p:.2%}\n'
+            f'SVD MSE:{mse_s:.2f} PSNR:{psnr_s:.2f} SSIM:{sm_s:.4f} Var:{var_s:.2%}'
         )
-        self.after(0, lambda: (
-            self.stats2.config(text=stats),
-            self.prog2.config(text="Done."),
-            self.btn_cmp2.config(state=tk.NORMAL)
-        ))
+        self._ui(lambda: self._show_comparison(images, stats))
+
+    def _show_comparison(self, images, stats):
+        for label, image in zip((self.pca_lbl2, self.svd_lbl2), images):
+            thumbnail = image.copy()
+            thumbnail.thumbnail((200, 200))
+            preview = ImageTk.PhotoImage(thumbnail)
+            label.config(image=preview)
+            label.image = preview
+        self.stats2.config(text=stats)
+        self.prog2.config(text='Done.')
 
     def analyze_metrics(self):
-        if not self.orig_pil:
-            messagebox.showwarning("No Image","Load an image first."); return
-        max_k, rgb = self.k_an.get(), self.rgb_var.get()
-        self.btn_an.config(state=tk.DISABLED)
-        threading.Thread(target=self._thread_analyze, args=(max_k,rgb), daemon=True).start()
+        try:
+            k = self.k_an.get()
+        except tk.TclError:
+            messagebox.showerror('Invalid k', 'k must be a positive integer.'); return
+        self._start_job(self._thread_analyze, (k, self.rgb_var.get()), self.prog3)
 
-    def _thread_analyze(self, max_k, rgb):
-        data = self.orig_color if rgb else self.orig_gray
+    def _thread_analyze(self, data, max_k, rgb):
+        max_k = min(max_k, min(data.shape[:2]))
         mses_p, vars_p, mses_s, vars_s = [], [], [], []
-        for k in range(1, max_k+1):
-            self.after(0, lambda i=k: self.prog3.config(text=f"Analyzing k={i}/{max_k}"))
+        for k in range(1, max_k + 1):
+            self._ui(lambda i=k: self.prog3.config(text=f'Analyzing k={i}/{max_k}'))
             p_img, var_p = compress_image_full(data, k, 'PCA')
             s_img, var_s = compress_image_full(data, k, 'SVD')
             mses_p.append(mse_metric(data, p_img))
             mses_s.append(mse_metric(data, s_img))
             vars_p.append(var_p)
             vars_s.append(var_s)
-        self.after(0, lambda: self._update_plots(mses_p, vars_p, mses_s, vars_s, max_k))
+        self._ui(lambda: self._update_plots(mses_p, vars_p, mses_s, vars_s, max_k))
 
     def _update_plots(self, mses_p, vars_p, mses_s, vars_s, max_k):
         ks = list(range(1, max_k+1))
@@ -268,7 +276,7 @@ class ImageCompressionApp(tk.Tk):
         self.ax_var.plot(ks, vars_s, 'b--', label='SVD Var')
         self.ax_var.set_title('Variance vs k'); self.ax_var.legend()
         self.canvas.draw()
-        self.after(0, lambda: self.prog3.config(text='Analysis Done.'))
+        self.prog3.config(text='Analysis Done.')
 
 if __name__ == "__main__":
     app = ImageCompressionApp()

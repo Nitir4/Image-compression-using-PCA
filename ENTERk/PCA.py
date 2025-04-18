@@ -1,25 +1,16 @@
-# PCA Implementation from scratch
+"""Float-valued PCA for the legacy normalized RGB interface."""
+import numbers
+import numpy as np
+
 def PCA(matrix, k):
-    # Compute the mean of the matrix along each feature
-    mean = np.mean(matrix, axis=0)
-    
-    # Center the matrix by subtracting the mean
-    centered = matrix - mean
-    
-    # Calculate the covariance matrix
-    cov_matrix = np.cov(centered, rowvar=False)
-    
-    # Compute eigenvalues and eigenvectors
-    eigenvalues, eigenvectors = np.linalg.eigh(cov_matrix)
-    
-    # Sort eigenvalues in descending order and select the top k eigenvectors
-    sorted_idx = np.argsort(eigenvalues)[::-1]
-    top_eigenvectors = eigenvectors[:, sorted_idx[:k]]
-    
-    # Project the original data onto the top k eigenvectors
-    projected = np.dot(centered, top_eigenvectors)
-    
-    # Reconstruct the data from the projection
-    reconstructed = np.dot(projected, top_eigenvectors.T) + mean
-    
-    return reconstructed, eigenvalues, sorted_idx
+    values = np.asarray(matrix, dtype=float)
+    if isinstance(k, bool) or not isinstance(k, numbers.Integral) or k < 1:
+        raise ValueError('k must be a positive integer.')
+    if values.ndim != 2 or 0 in values.shape or not np.isfinite(values).all():
+        raise ValueError('Expected a nonempty finite image channel.')
+    mean = values.mean(axis=0)
+    centered = values - mean
+    _, spectrum, vt = np.linalg.svd(centered, full_matrices=False)
+    retained = vt[:min(k, len(vt))]
+    eigenvalues = spectrum ** 2 / max(len(values) - 1, 1)
+    return (centered @ retained.T) @ retained + mean, eigenvalues, np.arange(len(eigenvalues))
