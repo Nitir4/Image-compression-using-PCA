@@ -1,0 +1,6 @@
+numpy>=1.26
+opencv-python-headless>=4.9
+Pillow>=10
+matplotlib>=3.8
+scikit-image>=0.22
+# Optional drag-and-drop support for ENTERk/main.py: tkinterdnd2
